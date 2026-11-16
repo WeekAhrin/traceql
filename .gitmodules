@@ -1,0 +1,15 @@
+[submodule "third_party/yaml-cpp"]
+	path = third_party/yaml-cpp
+	url = https://github.com/jbeder/yaml-cpp
+[submodule "third_party/nlohmann"]
+	path = third_party/nlohmann
+	url = https://github.com/nlohmann/json
+[submodule "third_party/concurrentqueue"]
+	path = third_party/concurrentqueue
+	url = https://github.com/cameron314/concurrentqueue
+[submodule "third_party/sigma"]
+	path = third_party/sigma
+	url = https://github.com/SigmaHQ/sigma.git
+[submodule "third_party/elastic"]
+	path = third_party/elastic
+	url = https://github.com/elastic/protections-artifacts.git

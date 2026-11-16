@@ -1,0 +1,476 @@
+#!/usr/bin/env python3
+"""Unified TraceQL CLI runner with dependency-aware incremental TU caching."""
+
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+import hashlib
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+
+def parse_depfile(dep_path: Path) -> list[str]:
+    if not dep_path.is_file():
+        return []
+    text = dep_path.read_text(encoding="utf-8", errors="replace")
+    text = text.replace("\\\n", " ")
+    if ":" not in text:
+        return []
+    _, deps_part = text.split(":", 1)
+    return [tok for tok in deps_part.split() if tok]
+
+
+def file_stat_sig(path: Path) -> str:
+    try:
+        st = path.stat()
+        return f"{path}:{st.st_mtime_ns}:{st.st_size}"
+    except OSError:
+        return f"{path}:missing"
+
+
+def compute_tu_key(
+    entry: dict[str, Any],
+    ast_plugin: Path,
+    ir_plugin: Path | None,
+    with_ir: bool,
+) -> str:
+    h = hashlib.sha256()
+    h.update(entry["file"].encode("utf-8"))
+    h.update(b"\0")
+    h.update(entry.get("directory", "").encode("utf-8"))
+    h.update(b"\0")
+    h.update(entry.get("command", "").encode("utf-8"))
+    h.update(b"\0")
+    h.update(file_stat_sig(ast_plugin).encode("utf-8"))
+    if with_ir and ir_plugin is not None:
+        h.update(b"\0")
+        h.update(file_stat_sig(ir_plugin).encode("utf-8"))
+    return h.hexdigest()[:24]
+
+
+def deps_up_to_date(meta_path: Path, dep_path: Path, ast_out: Path, ir_out: Path | None, with_ir: bool) -> bool:
+    if not meta_path.is_file() or not ast_out.is_file():
+        return False
+    if with_ir and (ir_out is None or not ir_out.is_file()):
+        return False
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+
+    recorded: dict[str, list[int]] = meta.get("deps", {})
+    if not recorded:
+        return False
+    for dep_str, (mtime_ns, size) in recorded.items():
+        try:
+            st = Path(dep_str).stat()
+        except OSError:
+            return False
+        if st.st_mtime_ns != mtime_ns or st.st_size != size:
+            return False
+    return True
+
+
+def build_base_clang_args(command: str, src: Path) -> list[str]:
+    tokens = shlex.split(command)
+    args = ["clang++"]
+    src_str = str(src)
+    src_resolved = str(src.resolve())
+    skip_next = False
+    for tok in tokens[1:]:
+        if skip_next:
+            skip_next = False
+            continue
+        if tok in ("-o", "-MF", "-MT", "-MQ"):
+            skip_next = True
+            continue
+        if tok in ("-c", "-MD", "-MMD"):
+            continue
+        if tok in ("-fcoroutines", "-fno-enforce-eh-specs"):
+            continue
+        if tok == src_str or tok == src_resolved:
+            continue
+        args.append(tok)
+    return args
+
+
+def analyze_tu(
+    entry: dict[str, Any],
+    cache_dir: Path,
+    ast_plugin: Path,
+    ir_plugin: Path | None,
+    with_ir: bool,
+    no_cache: bool,
+) -> tuple[str, bool, list[Path], str]:
+    src = Path(entry["file"])
+    cwd = entry.get("directory") or os.getcwd()
+    key = compute_tu_key(entry, ast_plugin, ir_plugin, with_ir)
+    tu_dir = cache_dir / "tus"
+    tu_dir.mkdir(parents=True, exist_ok=True)
+
+    ast_out = tu_dir / f"{key}.ast.json"
+    ir_out = (tu_dir / f"{key}.ir.json") if with_ir else None
+    dep_path = tu_dir / f"{key}.d"
+    meta_path = tu_dir / f"{key}.meta.json"
+
+    if not no_cache and deps_up_to_date(meta_path, dep_path, ast_out, ir_out, with_ir):
+        outputs = [ast_out] + ([ir_out] if ir_out is not None else [])
+        return (str(src), True, outputs, "")
+
+    base_args = build_base_clang_args(entry["command"], src)
+    ast_cmd = base_args + [
+        "-fsyntax-only",
+        "-w",
+        "-MD",
+        "-MF",
+        str(dep_path),
+        f"-fplugin={ast_plugin}",
+        "-Xclang",
+        "-add-plugin",
+        "-Xclang",
+        "traceql",
+        "-Xclang",
+        "-plugin-arg-traceql",
+        "-Xclang",
+        "--no-auto-scan",
+        "-Xclang",
+        "-plugin-arg-traceql",
+        "-Xclang",
+        f"--emit-patterns={ast_out}",
+        str(src),
+    ]
+    res = subprocess.run(ast_cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if res.returncode != 0 or not ast_out.is_file():
+        return (str(src), False, [], res.stderr.strip() or f"clang++ exited with {res.returncode}")
+
+    outputs = [ast_out]
+    if with_ir and ir_plugin is not None and ir_out is not None:
+        obj_tmp = tu_dir / f"{key}.o"
+        ir_cmd = base_args + [
+            "-O2",
+            "-g",
+            "-w",
+            "-c",
+            "-o",
+            str(obj_tmp),
+            f"-fpass-plugin={ir_plugin}",
+            "-mllvm",
+            f"-traceql-ir-out={ir_out}",
+            str(src),
+        ]
+        ir_res = subprocess.run(ir_cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            obj_tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        if ir_res.returncode == 0 and ir_out.is_file():
+            outputs.append(ir_out)
+
+    deps_list = parse_depfile(dep_path)
+    if str(src) not in deps_list:
+        deps_list.insert(0, str(src))
+    dep_stats: dict[str, list[int]] = {}
+    for d in deps_list:
+        p = Path(d)
+        try:
+            st = p.stat()
+            dep_stats[str(p)] = [st.st_mtime_ns, st.st_size]
+        except OSError:
+            pass
+    meta_path.write_text(json.dumps({"file": str(src), "deps": dep_stats}), encoding="utf-8")
+    return (str(src), False, outputs, "")
+
+
+def parse_git_diff(diff_base: str) -> tuple[Path | None, dict[str, list[tuple[int, int]]]]:
+    top_res = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    repo_root = Path(top_res.stdout.strip()).resolve() if top_res.returncode == 0 and top_res.stdout.strip() else None
+    cwd = str(repo_root) if repo_root is not None else os.getcwd()
+
+    diff_res = subprocess.run(
+        ["git", "diff", "--unified=0", diff_base],
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if diff_res.returncode != 0:
+        raise RuntimeError(diff_res.stderr.strip() or f"git diff exited with {diff_res.returncode}")
+
+    changed: dict[str, list[tuple[int, int]]] = {}
+    current_file: str | None = None
+    hunk_re = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
+
+    for line in diff_res.stdout.splitlines():
+        if line.startswith("+++ "):
+            target = line[4:].strip()
+            if target == "/dev/null":
+                current_file = None
+                continue
+            if target.startswith("b/"):
+                target = target[2:]
+            current_file = target
+            changed.setdefault(current_file, [])
+        elif line.startswith("@@ ") and current_file is not None:
+            m = hunk_re.match(line)
+            if m:
+                start = int(m.group(1))
+                count = int(m.group(2)) if m.group(2) is not None else 1
+                changed[current_file].append((start, count))
+    return repo_root, changed
+
+
+def _lookup_changed_ranges(
+    file_str: str,
+    repo_root: Path | None,
+    changed: dict[str, list[tuple[int, int]]],
+) -> list[tuple[int, int]] | None:
+    if not file_str:
+        return None
+    norm = file_str.replace("\\", "/")
+    if norm in changed:
+        return changed[norm]
+    if repo_root is not None:
+        try:
+            rel = Path(file_str).resolve().relative_to(repo_root).as_posix()
+            if rel in changed:
+                return changed[rel]
+        except (OSError, ValueError):
+            pass
+    for rel_path, ranges in changed.items():
+        if norm.endswith("/" + rel_path):
+            return ranges
+    return None
+
+
+def _location_in_diff(
+    file_str: str,
+    line_num: int,
+    repo_root: Path | None,
+    changed: dict[str, list[tuple[int, int]]],
+) -> bool:
+    ranges = _lookup_changed_ranges(file_str, repo_root, changed)
+    if ranges is None:
+        return False
+    if line_num <= 0:
+        return True
+    return any(start <= line_num < start + max(1, count) for start, count in ranges)
+
+
+def filter_findings_by_diff(out_path: Path, behavior_format: str, diff_base: str) -> None:
+    repo_root, changed = parse_git_diff(diff_base)
+    fmt = behavior_format
+    if not fmt:
+        lower = out_path.name.lower()
+        if lower.endswith(".sarif") or lower.endswith(".sarif.json"):
+            fmt = "sarif"
+        elif lower.endswith(".yml") or lower.endswith(".yaml"):
+            fmt = "sigma"
+        else:
+            fmt = "json"
+
+    if fmt == "sigma":
+        return
+
+    data = json.loads(out_path.read_text(encoding="utf-8"))
+    if fmt == "sarif":
+        total = 0
+        kept_total = 0
+        for run in data.get("runs", []):
+            results = run.get("results", [])
+            total += len(results)
+            changed_callers: set[str] = set()
+            for r in results:
+                locs = r.get("locations", [])
+                phys = locs[0].get("physicalLocation", {}) if locs else {}
+                f_uri = phys.get("artifactLocation", {}).get("uri", "")
+                l_num = int(phys.get("region", {}).get("startLine", 0) or 0)
+                caller = r.get("properties", {}).get("caller", "")
+                if _location_in_diff(f_uri, l_num, repo_root, changed) and caller:
+                    changed_callers.add(caller)
+
+            kept_results = []
+            for r in results:
+                locs = r.get("locations", [])
+                phys = locs[0].get("physicalLocation", {}) if locs else {}
+                f_uri = phys.get("artifactLocation", {}).get("uri", "")
+                l_num = int(phys.get("region", {}).get("startLine", 0) or 0)
+                caller = r.get("properties", {}).get("caller", "")
+                if _location_in_diff(f_uri, l_num, repo_root, changed) or (
+                    caller and caller in changed_callers
+                ):
+                    kept_results.append(r)
+            run["results"] = kept_results
+            kept_total += len(kept_results)
+        out_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        print(f"[traceql] diff-filter base={diff_base}: kept {kept_total}/{total} findings")
+        return
+
+    findings = data.get("findings", [])
+    total = len(findings)
+    changed_callers = {
+        f.get("caller", "")
+        for f in findings
+        if f.get("caller") and _location_in_diff(f.get("file", ""), int(f.get("line", 0) or 0), repo_root, changed)
+    }
+    kept = [
+        f
+        for f in findings
+        if _location_in_diff(f.get("file", ""), int(f.get("line", 0) or 0), repo_root, changed)
+        or (f.get("caller") and f.get("caller") in changed_callers)
+    ]
+    data["findings"] = kept
+    data["finding_count"] = len(kept)
+    out_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    print(f"[traceql] diff-filter base={diff_base}: kept {len(kept)}/{total} findings")
+
+
+def main() -> int:
+    root = Path(__file__).resolve().parent
+    default_build = root / "build"
+
+    parser = argparse.ArgumentParser(description="TraceQL incremental AST + IR analysis runner")
+    parser.add_argument("--compile-commands", required=True, help="Path to compile_commands.json")
+    parser.add_argument("--build-dir", default=str(default_build), help="TraceQL CMake build directory")
+    parser.add_argument("--cache-dir", default=".traceql_cache", help="Incremental TU cache directory")
+    parser.add_argument("--no-cache", action="store_true", help="Ignore existing cache and re-analyze all TUs")
+    parser.add_argument("--with-ir", action="store_true", help="Also run TraceQLIR.so pass at -O2")
+    parser.add_argument("--filter", default="", help="Regex to include only matching TU file paths")
+    parser.add_argument("--exclude", default="", help="Regex to exclude matching TU file paths")
+    parser.add_argument("--dataset", default=str(root / "datasets"), help="Dataset file or directory")
+    parser.add_argument("--emit-patterns", default="", help="Write merged cross-TU patterns JSON")
+    parser.add_argument("--emit-behavior-rules", default="", help="Write behavior findings (.json/.yml/.sarif)")
+    parser.add_argument("--emit-mermaid", default="", help="Write Mermaid flowchart (.mmd)")
+    parser.add_argument("--emit-dot", default="", help="Write Graphviz DOT graph (.dot)")
+    parser.add_argument("--diff-base", default="", help="Git ref for PR/diff mode; filter findings to changed files/lines")
+    parser.add_argument("--behavior-format", default="", choices=["", "json", "sigma", "sarif"])
+    parser.add_argument("--target-os", default="auto", choices=["auto", "windows", "linux", "android"])
+    parser.add_argument("--risk-threshold", type=int, default=40)
+    parser.add_argument("--entropy-threshold", type=float, default=6.8)
+    parser.add_argument("--jobs", type=int, default=os.cpu_count() or 4)
+    args = parser.parse_args()
+
+    build_dir = Path(args.build_dir).resolve()
+    ast_plugin = build_dir / "TraceQL.so"
+    ir_plugin = build_dir / "TraceQLIR.so"
+    merge_bin = build_dir / "traceql_merge"
+
+    if not ast_plugin.is_file() or not merge_bin.is_file():
+        print(f"[traceql] missing build artifacts in {build_dir}", file=sys.stderr)
+        return 2
+    if args.with_ir and not ir_plugin.is_file():
+        print(f"[traceql] missing {ir_plugin} for --with-ir", file=sys.stderr)
+        return 2
+
+    cc_entries = json.loads(Path(args.compile_commands).read_text(encoding="utf-8"))
+    inc_re = re.compile(args.filter) if args.filter else None
+    exc_re = re.compile(args.exclude) if args.exclude else None
+
+    seen: set[str] = set()
+    jobs: list[dict[str, Any]] = []
+    for e in cc_entries:
+        f = e.get("file", "")
+        if not f or f in seen:
+            continue
+        if inc_re and not inc_re.search(f):
+            continue
+        if exc_re and exc_re.search(f):
+            continue
+        seen.add(f)
+        jobs.append(e)
+
+    t0 = time.monotonic()
+    cache_dir = Path(args.cache_dir).resolve()
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    hits = 0
+    misses = 0
+    failed = 0
+    pattern_files: list[Path] = []
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.jobs)) as ex:
+        futs = [
+            ex.submit(
+                analyze_tu,
+                e,
+                cache_dir,
+                ast_plugin,
+                ir_plugin if args.with_ir else None,
+                args.with_ir,
+                args.no_cache,
+            )
+            for e in jobs
+        ]
+        for src, is_hit, outputs, err in (f.result() for f in futs):
+            if err:
+                failed += 1
+                print(f"[traceql] warn: failed {src}: {err.splitlines()[0]}", file=sys.stderr)
+                continue
+            if is_hit:
+                hits += 1
+            else:
+                misses += 1
+            pattern_files.extend(outputs)
+
+    if not pattern_files:
+        print("[traceql] no TU pattern files generated", file=sys.stderr)
+        return 1
+
+    merge_cmd = [
+        str(merge_bin),
+        f"--target-os={args.target_os}",
+        f"--risk-threshold={args.risk_threshold}",
+        f"--entropy-threshold={args.entropy_threshold}",
+    ]
+    if args.dataset:
+        merge_cmd.append(f"--load-dataset={args.dataset}")
+    if args.emit_patterns:
+        merge_cmd.append(f"--emit-patterns={args.emit_patterns}")
+    if args.emit_behavior_rules:
+        merge_cmd.append(f"--emit-behavior-rules={args.emit_behavior_rules}")
+    if args.emit_mermaid:
+        merge_cmd.append(f"--emit-mermaid={args.emit_mermaid}")
+    if args.emit_dot:
+        merge_cmd.append(f"--emit-dot={args.emit_dot}")
+    if args.behavior_format:
+        merge_cmd.append(f"--behavior-format={args.behavior_format}")
+    merge_cmd.extend(str(p) for p in pattern_files)
+
+    merge_res = subprocess.run(merge_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    elapsed = time.monotonic() - t0
+    print(
+        f"[traceql] TUs={len(jobs)} hits={hits} misses={misses} failed={failed} "
+        f"patterns={len(pattern_files)} elapsed={elapsed:.2f}s"
+    )
+    if merge_res.stdout.strip():
+        print(merge_res.stdout.strip())
+    if merge_res.returncode != 0:
+        print(merge_res.stderr.strip(), file=sys.stderr)
+        return merge_res.returncode
+    if args.diff_base and args.emit_behavior_rules:
+        try:
+            filter_findings_by_diff(
+                Path(args.emit_behavior_rules),
+                args.behavior_format,
+                args.diff_base,
+            )
+        except Exception as exc:
+            print(f"[traceql] diff-filter failed: {exc}", file=sys.stderr)
+            return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

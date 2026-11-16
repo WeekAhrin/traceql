@@ -1,0 +1,157 @@
+[rule]
+description = """
+This rule monitors for a set of Linux utilities that can be used for tunneling and port forwarding. Attackers can
+leverage tunneling and port forwarding techniques to bypass network defenses, establish hidden communication channels,
+and gain unauthorized access to internal resources, facilitating data exfiltration, lateral movement, and remote
+control.
+"""
+id = "a5cfaae1-ee03-40f3-af2a-25a23f2abebf"
+license = "Elastic License v2"
+name = "Potential Linux Tunneling and/or Port Forwarding"
+os_list = ["linux"]
+reference = [
+    "https://developers.cloudflare.com/cloudflare-one/connections/connect-apps/install-and-setup/tunnel-useful-commands/",
+    "https://www.trendmicro.com/tr_tr/research/26/c/dissecting-a-warlock-attack.html",
+    "https://github.com/P001water/yuze",
+    "https://flare.io/learn/resources/blog/teampcp-cloud-native-ransomware",
+    "https://blog.bitsadmin.com/living-off-the-foreign-land-windows-as-offensive-platform",
+    "https://github.com/erebe/wstunnel",
+]
+version = "1.0.9"
+
+query = '''
+process where event.type == "start" and event.action == "exec" and (
+  (
+    // Tunneling and/or Port Forwarding via process command line
+    (
+      process.command_line regex """.*[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}:[0-9]{1,5}:[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}:[0-9]{1,5}.*"""
+    ) or
+    // gost
+    (
+      process.name == "gost" and process.args like~ ("-L*", "-C*", "-R*")
+    ) or
+    // ngrok
+    (
+      process.name == "ngrok" and process.args in ("http", "https", "tcp", "tls") and
+      not (process.executable like "/scratch/project/*/tools/ngrok/ngrok" and process.command_line like "*127.0.0.1*")
+    ) or
+    // earthworm
+    (
+      process.args == "-s" and process.args == "-d" and process.args == "rssocks"
+    ) or
+    // chisel
+    (
+      process.name like~ "chisel*" and process.args in ("client", "server")
+    ) or
+    // vscode
+    (
+      process.name == "code" and process.args == "tunnel" and
+      not (
+        process.args == "kill" or
+        (process.executable like "/scratch/user/*/.vscode/code" and process.args == "-cli-data-dir")
+      )
+    ) or
+    // QEMU
+    (
+      process.name like ("qemu-system-*", ".qemu-system-*") and
+      process.args == "-netdev" and process.args like "*socket*" and (
+        (
+          process.args == "-nographic" and process.command_line like~ "*connect=*" and process.command_line like~ "*restrict=off*"
+        ) or
+        (
+          process.command_line like~ "*hostfwd=*" and
+          /* Common uses of hostfwd */
+          not process.command_line like "*hostfwd=tcp::*-:22*"
+        )
+      )
+    ) or
+    // yuze
+    (
+      (
+        process.args == "proxy" and process.args == "-l" and process.args_count >= 4
+      ) or
+      (
+        process.args == "fwd" and process.args == "-l" and process.args == "-f" and process.args_count >= 6 and
+        process.command_line regex """.*[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}:[0-9]{1,5}.*"""
+      ) or
+      (
+        process.args == "reverse" and (
+          (
+            process.args == "-s" and process.args == "-l" and process.args_count >= 6
+          ) or
+          (
+            process.args == "-c" and process.args_count >= 4 and
+            process.command_line regex """.*[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}:[0-9]{1,5}.*"""
+          )
+        )
+      )
+    ) or
+    // Common tunneling tools 
+    (
+      process.name in~ (
+        "iodine", "iodined", "dnscat", "hans", "hans-ubuntu", "ptunnel-ng", "ssf", "3proxy", "wstunnel", "pivotnacci",
+        "frps", "proxychains", "yuze"
+      )
+    )
+  )
+) and
+not (
+  (
+    process.name in ("bash", "dash", "sh", "tcsh", "csh", "zsh", "ksh", "fish", "mksh") and
+    process.args like "ssh*"
+  ) or
+  process.parent.args == "/usr/bin/crun" or
+  process.executable in (
+    "/usr/bin/podman", "/usr/bin/crontab", "/usr/bin/rg", "/usr/bin/ssh", "/usr/bin/autossh", "/usr/local/bin/rtk", "/usr/lib/autossh/autossh"
+  ) or
+  process.parent.executable in (
+    "/usr/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex",
+    "/usr/share/antigravity/resources/app/extensions/antigravity/bin/language_server_linux_x64"
+  ) or
+  process.parent.executable like "/home/linuxbrew/.linuxbrew/Caskroom/codex/*/codex-x86_64-unknown-linux-musl" or
+  process.executable like ("/tmp/.mount_cursor*/ripgrep/bin/rg", "/home/*/.local/bin/code", "/home/*/.local/bin/rtk", "/home/*/.cursor-server/bin/linux-x64/*") or
+  process.parent.command_line == "runc init" or
+  process.args == "/usr/bin/autossh" or
+  (
+    process.parent.executable == "/opt/rancher-desktop/resources/resources/linux/lima/bin/limactl" and
+    process.executable == "/usr/bin/qemu-system-x86_64"
+  ) or
+  (
+    process.executable == "/usr/bin/gssh-agent" and
+    process.command_line like "/usr/bin/python3 /usr/bin/gssh-agent /usr/bin/ssh -N -o BatchMode=yes *" and
+    process.args in ("-L", "-R") and
+    process.args like "127.0.0.1:*:127.0.0.1:*"
+  ) or
+  process.parent.executable like "/home/linuxbrew/.linuxbrew/Caskroom/codex/*/bin/codex" or
+  process.parent.command_line like "*/home/*/.claude/*shell-snapshots/snapshot*" or
+  (process.executable == "/usr/bin/qemu-system-x86_64" and process.parent.command_line == "bash /run/entry.sh")
+)
+'''
+
+min_endpoint_version = "7.15.0"
+optional_actions = []
+[[actions]]
+action = "kill_process"
+field = "process.entity_id"
+state = 0
+
+[[actions]]
+action = "kill_process"
+field = "process.parent.entity_id"
+state = 0
+
+[[threat]]
+framework = "MITRE ATT&CK"
+[[threat.technique]]
+id = "T1572"
+name = "Protocol Tunneling"
+reference = "https://attack.mitre.org/techniques/T1572/"
+
+
+[threat.tactic]
+id = "TA0011"
+name = "Command and Control"
+reference = "https://attack.mitre.org/tactics/TA0011/"
+
+[internal]
+min_endpoint_version = "7.15.0"
