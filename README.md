@@ -7,10 +7,12 @@
 ![LLVM IR](https://img.shields.io/badge/LLVM-IR%20Pass-informational)
 ![CMake 3.20+](https://img.shields.io/badge/CMake-3.20%2B-064F8C)
 
-![Linux](https://img.shields.io/badge/Linux-FCC624?logo=linux&logoColor=black)
 ![macOS](https://img.shields.io/badge/macOS-000000?logo=apple&logoColor=white)
+![Linux](https://img.shields.io/badge/Linux-FCC624?logo=linux&logoColor=black)
 ![Android](https://img.shields.io/badge/Android-3DDC84?logo=android&logoColor=white)
 ![Windows](https://img.shields.io/badge/Windows-0078D4?logo=windows&logoColor=white)
+
+---
 
 </div>
 
