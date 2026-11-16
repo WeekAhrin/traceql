@@ -13,3 +13,6 @@
 [submodule "third_party/elastic"]
 	path = third_party/elastic
 	url = https://github.com/elastic/protections-artifacts.git
+[submodule "third_party/AndKittyInjector"]
+	path = third_party/AndKittyInjector
+	url = https://github.com/MJx0/AndKittyInjector.git
